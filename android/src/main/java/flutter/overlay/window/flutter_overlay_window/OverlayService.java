@@ -54,6 +54,10 @@ public class OverlayService extends Service implements View.OnTouchListener {
 
     public static final String INTENT_EXTRA_IS_CLOSE_WINDOW = "IsCloseWindow";
 
+    private static final String PREFS_NAME = "flutter_overlay_window_prefs";
+    private static final String KEY_LAST_X_DP = "last_x_dp";
+    private static final String KEY_LAST_Y_DP = "last_y_dp";
+
     private static OverlayService instance;
     public static boolean isRunning = false;
     private WindowManager windowManager = null;
@@ -103,6 +107,11 @@ public class OverlayService extends Service implements View.OnTouchListener {
         mResources = getApplicationContext().getResources();
         int startX = intent.getIntExtra("startX", OverlayConstants.DEFAULT_XY);
         int startY = intent.getIntExtra("startY", OverlayConstants.DEFAULT_XY);
+        // If Flutter didn't provide an explicit startPosition, restore the last saved position.
+        if (startX == OverlayConstants.DEFAULT_XY && startY == OverlayConstants.DEFAULT_XY) {
+            startX = loadLastXdp(OverlayConstants.DEFAULT_XY);
+            startY = loadLastYdp(OverlayConstants.DEFAULT_XY);
+        }
         boolean isCloseWindow = intent.getBooleanExtra(INTENT_EXTRA_IS_CLOSE_WINDOW, false);
         if (isCloseWindow) {
             if (windowManager != null) {
@@ -176,10 +185,22 @@ public class OverlayService extends Service implements View.OnTouchListener {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && WindowSetup.flag == clickableFlag) {
             params.alpha = MAXIMUM_OPACITY_ALLOWED_FOR_S_AND_HIGHER;
         }
+        // When dragging is enabled, use a single consistent coordinate system (TOP|LEFT).
+        // This prevents "auto" snapping/persisted positions from behaving differently per gravity.
+        if (WindowSetup.enableDrag) {
+            WindowSetup.gravity = Gravity.TOP | Gravity.LEFT;
+        }
         params.gravity = WindowSetup.gravity;
         flutterView.setOnTouchListener(this);
         windowManager.addView(flutterView, params);
         moveOverlay(dx, dy, null);
+        // Ensure initial layout is clamped after the view is measured (prevents opening off-screen).
+        flutterView.post(() -> {
+            if (windowManager == null || flutterView == null) return;
+            WindowManager.LayoutParams lp = (WindowManager.LayoutParams) flutterView.getLayoutParams();
+            clampLayoutToScreen(lp);
+            windowManager.updateViewLayout(flutterView, lp);
+        });
         return START_STICKY;
     }
 
@@ -249,6 +270,11 @@ public class OverlayService extends Service implements View.OnTouchListener {
             params.width = (width == -1999 || width == -1) ? -1 : dpToPx(width);
             params.height = (height != 1999 || height != -1) ? dpToPx(height) : height;
             WindowSetup.enableDrag = enableDrag;
+            if (enableDrag) {
+                WindowSetup.gravity = Gravity.TOP | Gravity.LEFT;
+                params.gravity = WindowSetup.gravity;
+            }
+            clampLayoutToScreen(params);
             windowManager.updateViewLayout(flutterView, params);
             result.success(true);
         } else {
@@ -261,6 +287,7 @@ public class OverlayService extends Service implements View.OnTouchListener {
             WindowManager.LayoutParams params = (WindowManager.LayoutParams) flutterView.getLayoutParams();
             params.x = (x == -1999 || x == -1) ? -1 : dpToPx(x);
             params.y = dpToPx(y);
+            clampLayoutToScreen(params);
             windowManager.updateViewLayout(flutterView, params);
             if (result != null)
                 result.success(true);
@@ -288,6 +315,7 @@ public class OverlayService extends Service implements View.OnTouchListener {
                 WindowManager.LayoutParams params = (WindowManager.LayoutParams) instance.flutterView.getLayoutParams();
                 params.x = (x == -1999 || x == -1) ? -1 : instance.dpToPx(x);
                 params.y = instance.dpToPx(y);
+                instance.clampLayoutToScreen(params);
                 instance.windowManager.updateViewLayout(instance.flutterView, params);
                 return true;
             } else {
@@ -405,6 +433,7 @@ public class OverlayService extends Service implements View.OnTouchListener {
                     int yy = params.y + ((int) dy * (invertY ? -1 : 1));
                     params.x = xx;
                     params.y = yy;
+                    clampLayoutToScreen(params);
                     if (windowManager != null) {
                         windowManager.updateViewLayout(flutterView, params);
                     }
@@ -419,6 +448,9 @@ public class OverlayService extends Service implements View.OnTouchListener {
                         mTrayTimerTask = new TrayAnimationTimerTask();
                         mTrayAnimationTimer = new Timer();
                         mTrayAnimationTimer.schedule(mTrayTimerTask, 0, 25);
+                    } else {
+                        // No snap animation; persist immediately.
+                        saveLastPositionPx(params.x, params.y);
                     }
                     return false;
                 default:
@@ -459,15 +491,93 @@ public class OverlayService extends Service implements View.OnTouchListener {
             mAnimationHandler.post(() -> {
                 params.x = (2 * (params.x - mDestX)) / 3 + mDestX;
                 params.y = (2 * (params.y - mDestY)) / 3 + mDestY;
+                clampLayoutToScreen(params);
                 if (windowManager != null) {
                     windowManager.updateViewLayout(flutterView, params);
                 }
                 if (Math.abs(params.x - mDestX) < 2 && Math.abs(params.y - mDestY) < 2) {
                     TrayAnimationTimerTask.this.cancel();
                     mTrayAnimationTimer.cancel();
+                    // Snap finished; persist final snapped position.
+                    saveLastPositionPx(mDestX, mDestY);
                 }
             });
         }
+    }
+
+    private int clampInt(int v, int min, int max) {
+        return Math.max(min, Math.min(max, v));
+    }
+
+    private Point getRealScreenSizePx() {
+        Point p = new Point();
+        if (windowManager == null) return p;
+        Display display = windowManager.getDefaultDisplay();
+        DisplayMetrics dm = new DisplayMetrics();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+            display.getRealMetrics(dm);
+        } else {
+            display.getMetrics(dm);
+        }
+        p.set(dm.widthPixels, dm.heightPixels);
+        return p;
+    }
+
+    private void clampLayoutToScreen(WindowManager.LayoutParams params) {
+        if (windowManager == null || flutterView == null) return;
+
+        int viewW = flutterView.getWidth();
+        int viewH = flutterView.getHeight();
+        if (viewW <= 0 || viewH <= 0) return;
+
+        Point screen = getRealScreenSizePx();
+        if (screen.x <= 0 || screen.y <= 0) return;
+
+        int maxX = Math.max(0, screen.x - viewW);
+        int maxY = Math.max(0, screen.y - viewH);
+
+        int g = WindowSetup.gravity;
+        boolean isLeft = (g & Gravity.LEFT) == Gravity.LEFT;
+        boolean isRight = (g & Gravity.RIGHT) == Gravity.RIGHT;
+        boolean isCenterH = !isLeft && !isRight;
+
+        boolean isTop = (g & Gravity.TOP) == Gravity.TOP;
+        boolean isBottom = (g & Gravity.BOTTOM) == Gravity.BOTTOM;
+        boolean isCenterV = !isTop && !isBottom;
+
+        // For LEFT/RIGHT gravities, LayoutParams.x is an offset from that edge (>= 0).
+        // For CENTER gravities, LayoutParams.x is an offset from center (can be negative).
+        if (isCenterH) {
+            int half = maxX / 2;
+            params.x = clampInt(params.x, -half, half);
+        } else {
+            params.x = clampInt(params.x, 0, maxX);
+        }
+
+        if (isCenterV) {
+            int half = maxY / 2;
+            params.y = clampInt(params.y, -half, half);
+        } else {
+            params.y = clampInt(params.y, 0, maxY);
+        }
+    }
+
+    private void saveLastPositionPx(int xPx, int yPx) {
+        int xDp = (int) Math.round(pxToDp(xPx));
+        int yDp = (int) Math.round(pxToDp(yPx));
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit()
+                .putInt(KEY_LAST_X_DP, xDp)
+                .putInt(KEY_LAST_Y_DP, yDp)
+                .apply();
+    }
+
+    private int loadLastXdp(int fallback) {
+        return getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getInt(KEY_LAST_X_DP, fallback);
+    }
+
+    private int loadLastYdp(int fallback) {
+        return getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getInt(KEY_LAST_Y_DP, fallback);
     }
 
 
