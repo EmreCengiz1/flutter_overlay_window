@@ -169,7 +169,8 @@ public class OverlayService extends Service implements View.OnTouchListener {
             szWindow.set(w, h);
         }
         int dx = startX == OverlayConstants.DEFAULT_XY ? 0 : startX;
-        int dy = startY == OverlayConstants.DEFAULT_XY ? -statusBarHeightPx() : startY;
+        // startPosition values are expressed in dp (from Flutter). Convert statusBar px -> dp for default.
+        int dy = startY == OverlayConstants.DEFAULT_XY ? -(int) Math.round(pxToDp(statusBarHeightPx())) : startY;
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                 WindowSetup.width == -1999 ? -1 : WindowSetup.width,
                 WindowSetup.height != -1999 ? WindowSetup.height : screenHeight(),
@@ -513,13 +514,14 @@ public class OverlayService extends Service implements View.OnTouchListener {
         Point p = new Point();
         if (windowManager == null) return p;
         Display display = windowManager.getDefaultDisplay();
-        DisplayMetrics dm = new DisplayMetrics();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
-            display.getRealMetrics(dm);
-        } else {
+        // Prefer the "usable" display size (consistent with existing snap logic using szWindow).
+        try {
+            display.getSize(p);
+        } catch (Exception ignored) {
+            DisplayMetrics dm = new DisplayMetrics();
             display.getMetrics(dm);
+            p.set(dm.widthPixels, dm.heightPixels);
         }
-        p.set(dm.widthPixels, dm.heightPixels);
         return p;
     }
 
@@ -528,13 +530,24 @@ public class OverlayService extends Service implements View.OnTouchListener {
 
         int viewW = flutterView.getWidth();
         int viewH = flutterView.getHeight();
-        if (viewW <= 0 || viewH <= 0) return;
+        // Fallbacks: during the first few frames width/height can be 0 even though layout params are valid.
+        if (viewW <= 0) viewW = flutterView.getMeasuredWidth();
+        if (viewH <= 0) viewH = flutterView.getMeasuredHeight();
 
         Point screen = getRealScreenSizePx();
         if (screen.x <= 0 || screen.y <= 0) return;
 
-        int maxX = Math.max(0, screen.x - viewW);
-        int maxY = Math.max(0, screen.y - viewH);
+        // Prefer window (LayoutParams) size because that's what WindowManager positions/clamps against.
+        int windowW = viewW;
+        int windowH = viewH;
+        if (params.width > 0) windowW = params.width;
+        else if (params.width == WindowManager.LayoutParams.MATCH_PARENT) windowW = screen.x;
+        if (params.height > 0) windowH = params.height;
+        else if (params.height == WindowManager.LayoutParams.MATCH_PARENT) windowH = screen.y;
+        if (windowW <= 0 || windowH <= 0) return;
+
+        int maxX = Math.max(0, screen.x - windowW);
+        int maxY = Math.max(0, screen.y - windowH);
 
         int g = WindowSetup.gravity;
         boolean isLeft = (g & Gravity.LEFT) == Gravity.LEFT;
